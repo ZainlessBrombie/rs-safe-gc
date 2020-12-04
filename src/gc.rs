@@ -34,8 +34,9 @@ impl GcEngine {
             entity.mark_all();
             self.group.set(self.group.get() + 2);
         }
-        self.generation.set(self.group.get());
+        self.generation.set(self.group.get() + 2);
         self.group.set(self.group.get() + 2);
+
         self.is_finding_roots.set(true);
         for (_, entity) in self.refs.borrow().iter() {
             if entity.is_rooted(self.group.get() % 2 == 0) {
@@ -43,6 +44,7 @@ impl GcEngine {
             }
         }
         self.is_finding_roots.set(false);
+
         let mut to_remove = Vec::new();
         for (id, entity) in self.refs.borrow().iter() {
             if entity.get_last_marking_gen() != self.group.get() {
@@ -94,6 +96,14 @@ impl <T: Mark> PossiblyRooted for GcInner<T> {
 
 pub struct Gc<T: Mark> {
     inner: Weak<GcInner<T>>,
+}
+
+impl <T: Mark> Clone for Gc<T> {
+    fn clone(&self) -> Self {
+        Gc {
+            inner: self.inner.clone()
+        }
+    }
 }
 
 pub struct GcRef<'a, T: Mark> {
@@ -190,15 +200,13 @@ impl<T: Mark> Mark for Gc<T> {
 impl<T: Mark> Mark for GcInner<T> {
     fn mark_all(&self) {
         let (generation, group, is_finding_roots) = ENGINE.with(|c| (c.generation.get(), c.group.get(), c.is_finding_roots.get()));
-        if is_finding_roots {
-            if generation > self.last_marking_gen.get() {
-                if generation % 2 == 0 {
-                    self.times_marked_even.set(self.times_marked_even.get() + 1);
-                    self.times_marked_uneven.set(0);
-                } else {
-                    self.times_marked_uneven.set(self.times_marked_uneven.get() + 1);
-                    self.times_marked_even.set(0);
-                }
+        if is_finding_roots && generation > self.last_marking_gen.get() {
+            if generation % 2 == 0 {
+                self.times_marked_even.set(self.times_marked_even.get() + 1);
+                self.times_marked_uneven.set(0);
+            } else {
+                self.times_marked_uneven.set(self.times_marked_uneven.get() + 1);
+                self.times_marked_even.set(0);
             }
         }
         let should_spread = self.last_marking_gen.replace(group) < generation;
