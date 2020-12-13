@@ -1,26 +1,67 @@
-use std::collections::{HashSet, HashMap, VecDeque, BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{HashSet, HashMap, VecDeque, BTreeMap, BTreeSet, BinaryHeap, LinkedList};
 use crate::identity::Identity;
 use std::rc::{Rc, Weak};
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, Ref, RefMut, BorrowMutError};
 use std::path::{Path, PathBuf};
 use std::num::*;
 use std::sync::atomic::*;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::marker::PhantomData;
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter, Pointer, Debug};
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 thread_local! {
     static ENGINE: GcEngine = GcEngine::new();
 }
 
 pub struct GcEngine {
-    generation: Cell<u64>,
-    group:  Cell<u64>,
+    generation: Cell<usize>,
+    group: Cell<usize>,
     is_finding_roots: Cell<bool>,
-    refs: RefCell<HashMap<Identity, Rc<dyn PossiblyRooted>>>,
+    refs: RefCell<LinkedList<Rc<dyn PossiblyRooted>>>,
+}
+
+impl<T: PossiblyRooted> PossiblyRooted for RefCell<Option<T>> {
+    fn is_rooted(&self) -> bool {
+        if let Ok(us) = RefCell::try_borrow(self) {
+            if let Some(us) = us.deref().as_ref() {
+                return us.is_rooted();
+            } else {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    fn get_last_marking_gen(&self) -> usize {
+        if let Some(us) = RefCell::borrow(self).deref().as_ref() { // TODO borrow panic
+            return us.get_last_marking_gen();
+        } else {
+            return 0;
+        }
+    }
+
+    fn reset_markers(&self) {
+        if let Some(us) = RefCell::borrow(self).deref().as_ref() { // TODO
+            return us.reset_markers();
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        if let Some(us) = RefCell::borrow(self).deref().as_ref() {
+            return us.is_dead();
+        } else {
+            true
+        }
+    }
+
+    fn mark_all(&self) {
+        unimplemented!()
+    }
 }
 
 impl GcEngine {
@@ -29,101 +70,204 @@ impl GcEngine {
     }
 
     pub fn collect(&self) {
+        // Reset markers
+        for _ in self.refs.borrow_mut().drain_filter(|entity| {
+            if entity.is_dead() {
+                true;
+            }
+            entity.reset_markers();
+            false
+        }) {}
         self.generation.set(self.generation.get() + 1);
-        for (_, entity) in self.refs.borrow().iter() {
-            entity.mark_all();
+        // Count connections
+        for entity in self.refs.borrow().iter() {
+            entity.deref().mark_all();
             self.group.set(self.group.get() + 2);
         }
+
         self.generation.set(self.group.get() + 2);
         self.group.set(self.group.get() + 2);
 
+        // Mark roots
         self.is_finding_roots.set(true);
-        for (_, entity) in self.refs.borrow().iter() {
-            if entity.is_rooted(self.group.get() % 2 == 0) {
+        for entity in self.refs.borrow().iter() {
+            if entity.is_rooted() {
                 entity.mark_all();
             }
         }
         self.is_finding_roots.set(false);
 
-        let mut to_remove = Vec::new();
-        for (id, entity) in self.refs.borrow().iter() {
-            if entity.get_last_marking_gen() != self.group.get() {
-                to_remove.push(id.clone());
+        let self_group = self.group.get();
+        for _ in self.refs.borrow_mut().drain_filter(|entity| {
+            if entity.get_last_marking_gen() != self_group || entity.is_dead() {
+                return true;
             }
-        }
-        let mut mut_borrow = self.refs.borrow_mut();
-        for remove_id in &to_remove {
-            (&mut mut_borrow).remove(remove_id);
-        }
+            false
+        }) {}
         self.generation.set(self.generation.get() + 2);
         self.group.set(self.generation.get());
     }
 }
 
-pub struct GcInner<T: Mark> {
-    data: T,
-    last_marking_gen: Cell<u64>,
-    times_marked_even: Cell<u64>,
-    times_marked_uneven: Cell<u64>,
-    self_pointer: Cell<Option<Weak<dyn Any>>>,
+pub struct Gc<T: Mark> {
+    inner: Weak<GcInner<T>>,
+    dropper: Dropper<T>,
 }
 
-trait PossiblyRooted: Mark {
-    fn is_rooted(&self, generation_is_even: bool) -> bool;
-    fn get_last_marking_gen(&self) -> u64;
+pub struct GcInner<T: Mark> {
+    data: T,
+    last_marking_gen: AtomicUsize,
+    // times_marked: AtomicUsize,
+    self_pointer: Cell<Option<Weak<dyn Any>>>,
+    id: Identity,
+    root_count: AtomicUsize,
 }
-impl <T: Mark> PossiblyRooted for GcInner<T> {
+
+trait PossiblyRooted {
+    fn is_rooted(&self) -> bool;
+    fn get_last_marking_gen(&self) -> usize;
+    fn reset_markers(&self);
+    fn is_dead(&self) -> bool;
+    fn mark_all(&self);
+}
+
+impl<T: Mark> PossiblyRooted for GcInner<T> {
     // Has been marked by:
     // + 1 the gc
     // + n neighbours pointing at us
     // Has weak refcount of self_ptr:
     // + 1 for self counter
+    // + 1 for dropper
     // + n neighbours pointing at us
     // + m roots pointed at us
     // -> if self_ptr has more refs than we have marks, we are rooted.
-    fn is_rooted(&self, generation_is_even: bool) -> bool {
-        let times_marked = if generation_is_even { self.times_marked_even.get() } else {self.times_marked_uneven.get() };
-        let self_ptr_temp = self.self_pointer.take();
-        let ret = self_ptr_temp.as_ref().unwrap().weak_count() > times_marked as usize;
-        self.self_pointer.set(self_ptr_temp);
-        return ret;
+    fn is_rooted(&self) -> bool {
+        self.root_count.load(Ordering::Relaxed) > 0
     }
 
-    fn get_last_marking_gen(&self) -> u64 {
-        self.last_marking_gen.get()
+    fn get_last_marking_gen(&self) -> usize {
+        self.last_marking_gen.load(Ordering::Relaxed)
+    }
+
+    fn reset_markers(&self) {
+        //self..store(0, Ordering::Relaxed);
+    }
+
+    fn is_dead(&self) -> bool {
+        //self.data.borrow().is_none()
+        unimplemented!()
+    }
+
+    fn mark_all(&self) {
+        unimplemented!()
     }
 }
 
-pub struct Gc<T: Mark> {
-    inner: Weak<GcInner<T>>,
+pub struct GcCell<T: Mark> {
+    internal_cell: RefCell<T>
 }
 
-impl <T: Mark> Clone for Gc<T> {
+impl <T:Mark> GcCell<T> {
+    pub fn new(o: T) -> GcCell<T> {
+        GcCell { internal_cell: RefCell::new(o) }
+    }
+
+    pub fn borrow(&self) -> GcCellRef<T> {
+        GcCellRef { r: self.internal_cell.borrow() }
+    }
+
+    pub fn try_borrow_mut(&self) -> Result<GcCellRefMut<T>, BorrowMutError> {
+        self.internal_cell.try_borrow_mut()
+            .map(|b| {
+                GcCellRefMut { rm: b }
+            })
+    }
+
+    pub fn borrow_mut(&self) -> GcCellRefMut<T> {
+        GcCellRefMut { rm: self.internal_cell.borrow_mut() }
+    }
+}
+
+impl <T: Mark> Mark for GcCell<T> {
+    fn mark_all(&self) {
+        unimplemented!()
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
+    }
+}
+
+pub struct GcCellRef<'a, T> where T: Mark {
+    r: Ref<'a, T>,
+}
+
+pub struct GcCellRefMut<'a, T: Mark> {
+    rm: RefMut< 'a,T>
+}
+
+impl <'a, T>Deref for GcCellRef<'a, T> where T: Mark {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.r.deref()
+    }
+}
+
+impl <'a, T>Deref for GcCellRefMut<'a, T> where T: Mark {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.rm.deref()
+    }
+}
+
+impl <'a, T>DerefMut for GcCellRefMut<'a, T> where T: Mark {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.rm.deref_mut()
+    }
+}
+
+impl <'a, T> GcCellRef<'a, T> where T: Mark {
+
+}
+
+impl <'a, T> GcCellRefMut<'a, T> where T: Mark {
+
+}
+
+impl<T: Mark> Clone for Gc<T> {
     fn clone(&self) -> Self {
         Gc {
-            inner: self.inner.clone()
+            inner: self.inner.clone(),
+            dropper: self.dropper.clone(),
         }
     }
 }
 
 pub struct GcRef<'a, T: Mark> {
     ptr: Rc<GcInner<T>>,
-    marker: PhantomData<&'a ()> // Don't you dare breaking my gc ;)
+    marker: PhantomData<&'a ()>, // Don't you dare breaking my gc ;)
 }
 
-impl <'a, T: Mark> Deref  for GcRef<'a, T> {
+impl<'a, T: Mark> Deref for GcRef<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.ptr.data.borrow()
+        self.as_ref()
     }
 }
 
 impl<T: Mark> Gc<T> {
     pub fn borrow(&self) -> GcRef<T> {
+        let rc = self.inner.upgrade().unwrap();
         GcRef {
-            ptr: self.inner.upgrade().unwrap(),
-            marker: Default::default()
+            ptr: rc,
+            marker: Default::default(),
         }
     }
 }
@@ -135,119 +279,215 @@ impl Gc<()> {
 }
 
 
-impl <T: Mark + Display> Display for Gc<T> {
+impl<T: Mark + Display> Display for Gc<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Gc::borrow(self).fmt(f)
     }
 }
 
-impl <T: Mark + Hash> Hash for Gc<T> {
+impl<T: Mark + Hash> Hash for Gc<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Gc::borrow(self).hash(state)
     }
 }
 
-impl <T: Mark + PartialEq> PartialEq for Gc<T> {
+impl<T: Mark + PartialEq> PartialEq for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
         Gc::borrow(self).deref() == Gc::borrow(other).deref()
     }
 }
 
-impl <T: Mark + Eq + PartialEq> Eq for Gc<T> {
+impl<T: Mark + Eq + PartialEq> Eq for Gc<T> {}
 
-}
-
-impl <T: Mark + Debug> Debug for Gc<T> {
+impl<T: Mark + Debug> Debug for Gc<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         (&Gc::borrow(self).ptr).fmt(f)
     }
 }
 
-impl <'a, T: Mark> AsRef<T> for GcRef<'a, T> {
+impl<'a, T: Mark> AsRef<T> for GcRef<'a, T> {
     fn as_ref(&self) -> &T {
-        self.ptr.data.borrow()
+        &self.ptr.data
     }
 }
 
-impl <T: Mark + 'static> Gc<T> {
+impl <T:Debug + Mark> Debug for GcCell<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        GcCell::borrow(self).fmt(f)
+    }
+}
+
+impl<T: Mark + 'static> Gc<T> {
     pub fn new(value: T) -> Gc<T> {
+        let id = Identity::new();
         let inner = GcInner {
             data: value,
-            last_marking_gen: Cell::new(0),
-            times_marked_even: Cell::new(0),
-            times_marked_uneven: Cell::new(0),
-            self_pointer: Cell::new(None)
+            last_marking_gen: Default::default(),
+            self_pointer: Cell::new(None),
+            id: id.clone(),
+            root_count: AtomicUsize::new(1),
         };
         let strong = Rc::new(inner);
         strong.self_pointer.set(Some(Rc::downgrade(&(strong.clone() as Rc<dyn Any>))));
         ENGINE.with(|engine| {
-            engine.refs.borrow_mut().insert(Identity::new(), strong.clone() as Rc<dyn PossiblyRooted>);
+            engine.refs.borrow_mut().push_back(strong.clone() as Rc<dyn PossiblyRooted>);
         });
-        return Gc { inner: Rc::downgrade(&strong) }
+        return Gc { inner: Rc::downgrade(&strong), dropper: Dropper { parent: Rc::downgrade(&strong) } };
+    }
+}
+
+struct Dropper<T: Mark> {
+    parent: Weak<GcInner<T>>
+}
+
+impl<T: Mark> Clone for Dropper<T> {
+    fn clone(&self) -> Self {
+        Dropper { parent: self.parent.clone() }
+    }
+}
+
+impl<T: Mark> Drop for Dropper<T> {
+    fn drop(&mut self) {
+        if self.parent.weak_count() == 2 { // Us and itself
+            //ENGINE.with(|e| {
+                // let keep_alive = self.parent.upgrade().unwrap().data.take();
+                //std::mem::drop(keep_alive);
+                // TODO unimplemented!()
+            //})
+        }
     }
 }
 
 pub trait Mark {
     fn mark_all(&self);
+
+    fn unroot(&self);
+
+    fn root(&self); // Note: Rc's are always considered roots
 }
 
 impl<T: Mark> Mark for Gc<T> {
     fn mark_all(&self) {
         self.inner.upgrade().unwrap().mark_all()
     }
+
+    fn unroot(&self) {
+        self.inner.upgrade().unwrap().unroot()
+    }
+
+    fn root(&self) {
+        self.inner.upgrade().unwrap().root()
+    }
 }
 
 impl<T: Mark> Mark for GcInner<T> {
     fn mark_all(&self) {
         let (generation, group, is_finding_roots) = ENGINE.with(|c| (c.generation.get(), c.group.get(), c.is_finding_roots.get()));
-        if is_finding_roots && generation > self.last_marking_gen.get() {
-            if generation % 2 == 0 {
-                self.times_marked_even.set(self.times_marked_even.get() + 1);
-                self.times_marked_uneven.set(0);
-            } else {
-                self.times_marked_uneven.set(self.times_marked_uneven.get() + 1);
-                self.times_marked_even.set(0);
-            }
+        if is_finding_roots && generation > self.last_marking_gen.load(Ordering::Relaxed) {
+            // todo self.times_marked.fetch_add(1, Ordering::Relaxed);
         }
-        let should_spread = self.last_marking_gen.replace(group) < generation;
+        let should_spread = self.last_marking_gen.swap(group, Ordering::Relaxed) < generation;
         if should_spread {
             self.data.mark_all();
         }
     }
-}
 
-impl <T: Mark> Mark for RefCell<T> {
-    fn mark_all(&self) {
-        self.borrow().mark_all();
+    fn unroot(&self) {
+        self.root_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn root(&self) {
+        self.root_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-impl <T: Mark> Mark for Box<T> {
+
+impl<T: Mark + ?Sized> Mark for Box<T> {
     fn mark_all(&self) {
         Box::deref(self).mark_all()
     }
+
+    fn unroot(&self) {
+        Box::deref(self).unroot()
+    }
+
+    fn root(&self) {
+        Box::deref(self).unroot()
+    }
 }
 
-impl <T: Mark> Mark for Rc<T> {
+impl<T: Mark + ?Sized> Mark for Rc<T> {
     fn mark_all(&self) {
         Rc::deref(self).mark_all()
     }
-}
 
-impl <T: Mark, E: Mark> Mark for Result<T, E> {
-    fn mark_all(&self) {
-        match self {
-            Ok(ok) => {ok.mark_all()}
-            Err(err) => {err.mark_all()}
-        }
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
     }
 }
 
-impl <T: Mark> Mark for Option<T> {
+impl <T: Mark + ?Sized> Mark for Arc<T> {
+    fn mark_all(&self) {
+        unimplemented!()
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
+    }
+}
+
+impl <T: Mark> Mark for Mutex<T> {
+    fn mark_all(&self) {
+        unimplemented!()
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
+    }
+}
+
+impl<T: Mark, E: Mark> Mark for Result<T, E> {
+    fn mark_all(&self) {
+        match self {
+            Ok(ok) => { ok.mark_all() }
+            Err(err) => { err.mark_all() }
+        }
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
+    }
+}
+
+impl<T: Mark> Mark for Option<T> {
     fn mark_all(&self) {
         if let Some(this) = self {
             this.mark_all()
         }
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
     }
 }
 
@@ -258,6 +498,14 @@ macro_rules! iter_impl {
                 for item in self.iter() {
                     item.mark_all()
                 }
+            }
+
+            fn unroot(&self) {
+                unimplemented!()
+            }
+
+            fn root(&self) {
+                unimplemented!()
             }
         }
     };
@@ -270,21 +518,37 @@ iter_impl!(VecDeque<T>);
 iter_impl!(BTreeSet<T>);
 iter_impl!(BinaryHeap<T>);
 
-impl <T: Mark, V: Mark> Mark for HashMap<T, V> {
+impl<T: Mark, V: Mark> Mark for HashMap<T, V> {
     fn mark_all(&self) {
         for item in self.iter() {
             item.0.mark_all();
             item.1.mark_all()
         }
     }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
+    }
 }
 
-impl <K: Mark, V: Mark> Mark for BTreeMap<K, V> {
+impl<K: Mark, V: Mark> Mark for BTreeMap<K, V> {
     fn mark_all(&self) {
         for item in self.iter() {
             item.0.mark_all();
             item.1.mark_all();
         }
+    }
+
+    fn unroot(&self) {
+        unimplemented!()
+    }
+
+    fn root(&self) {
+        unimplemented!()
     }
 }
 macro_rules! empty_mark {
@@ -292,6 +556,14 @@ macro_rules! empty_mark {
         $(
             impl Mark for $T {
                 fn mark_all(&self) {}
+
+                fn unroot(&self) {
+                    unimplemented!()
+                }
+
+                fn root(&self) {
+                    unimplemented!()
+                }
             }
         )*
     }
@@ -324,6 +596,14 @@ macro_rules! tuple_marks {
                         }
                     }
                     inner_hack::mark_all(&self);
+                }
+
+                fn unroot(&self) {
+                    unimplemented!()
+                }
+
+                fn root(&self) {
+                    unimplemented!()
                 }
             }
         )*

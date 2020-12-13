@@ -1,46 +1,80 @@
 use crate::gc::{Gc, Mark};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod gc;
 mod identity;
 
-struct A {
-    a: Gc<String>,
-    b: RefCell<Gc<B>>
+static A: AtomicU64 = AtomicU64::new(0);
+
+enum GcTree {
+    Leaf,
+    Knot(Gc<GcTree>, Gc<GcTree>, u8),
 }
 
-struct B {
-    b: Gc<String>
-}
-
-impl Mark for A {
+impl Mark for GcTree {
     fn mark_all(&self) {
-        self.a.mark_all();
-        self.b.mark_all();
+        if let GcTree::Knot(a, b, c) = self {
+            a.mark_all();
+            b.mark_all();
+            c.mark_all();
+        }
     }
 }
 
-impl Mark for B {
-    fn mark_all(&self) {
-        self.b.mark_all()
+impl GcTree {
+    pub fn new(depth: u32) -> GcTree {
+        A.fetch_add(1, Ordering::Relaxed);
+        if depth == 0 {
+            return GcTree::Leaf;
+        }
+        return GcTree::Knot(
+            Gc::new(GcTree::new(depth - 1)),
+            Gc::new(GcTree::new(depth - 1)),
+            10,
+        );
     }
 }
 
-impl Drop for B {
+impl Drop for GcTree {
     fn drop(&mut self) {
-        println!("Dropping")
+        A.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 fn main() {
-    let a = Gc::new(A { a: Gc::new("A".into()), b: RefCell::from(Gc::new(B { b: Gc::new("B".into()) })) });
-    println!("{}", (&a.borrow().b.borrow()).borrow().b);
+    println!("Creating tree...");
+    let mut before = std::time::Instant::now();
+    let tree = Gc::new(GcTree::new(21));
+    let tree2 = tree.clone();
+    let mut after = std::time::Instant::now();
+    println!(
+        "Done after {}ms. Running gc...",
+        (after - before).as_millis()
+    );
+
+    before = std::time::Instant::now();
     Gc::collect();
-    println!("{}", (&a.borrow().b.borrow()).borrow().b);
-    a.borrow().b.replace(Gc::new(B { b: Gc::new("C".into()) }));
-    println!("{}", (&a.borrow().b.borrow()).borrow().b);
+    after = std::time::Instant::now();
+
+    println!(
+        "Done with gc scan after {}ms. Releasing Objects...",
+        (after - before).as_millis()
+    );
+
+    println!("Created objects: {}", A.load(Ordering::Relaxed));
+    std::mem::drop(tree);
+    before = std::time::Instant::now();
     Gc::collect();
-    Gc::collect();
-    std::thread::sleep(Duration::new(4, 0));
+    std::mem::drop(tree2);
+    //Gc::collect();
+    after = std::time::Instant::now();
+
+    println!(
+        "Done with gc cleanup after {}ms.",
+        (after - before).as_millis()
+    );
+
+    println!("Done. Remaining objects: {}", A.load(Ordering::Relaxed));
 }

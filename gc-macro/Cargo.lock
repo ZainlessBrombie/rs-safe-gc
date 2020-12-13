@@ -19,13 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "safe-gc"
-version = "0.1.0"
-dependencies = [
- "safe_gc_derive",
-]
-
-[[package]]
 name = "safe_gc_derive"
 version = "0.0.0"
 dependencies = [
