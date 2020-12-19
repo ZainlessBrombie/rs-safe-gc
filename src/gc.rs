@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+// TODO implement for linkedlist
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::num::*;
@@ -26,8 +27,22 @@ pub struct GcEngine {
     collection_reasonable: Cell<bool>,
     bytes_allocated: Cell<usize>,
     last_collection: Cell<usize>,
-    direct_cells: RefCell<LinkedList<Weak<dyn ConditionallyDestroyable>>>,
-    root_counted: RefCell<LinkedList<Weak<dyn Markable>>>,
+    direct_cells: RefCell<Vec<Weak<dyn ConditionallyDestroyable>>>,
+    root_counted: RefCell<Vec<Weak<dyn Markable>>>,
+}
+
+fn drain_filter_vec<T, F>(v: &mut Vec<T>, f: F)
+where
+    F: Fn(&mut T) -> bool,
+{
+    let mut cursor = 0;
+    for i in 0..v.len() {
+        if !f(v.get_mut(cursor).unwrap()) {
+            v.swap(i, cursor);
+            cursor += 1;
+        }
+    }
+    v.truncate(cursor);
 }
 
 impl GcEngine {
@@ -47,30 +62,22 @@ impl GcEngine {
         self.generation.set(generation);
         self.collection_reasonable.set(false);
 
-        self.root_counted
-            .borrow_mut()
-            .drain_filter(|el| {
-                if let Some(el) = el.upgrade() {
-                    el.mark_if_rooted(generation);
-                    return false;
-                } else {
-                    return true;
-                }
-            })
-            .filter(|_| false)
-            .next();
+        drain_filter_vec(&mut self.root_counted.borrow_mut(), |el| {
+            if let Some(el) = el.upgrade() {
+                el.mark_if_rooted(generation);
+                return false;
+            } else {
+                return true;
+            }
+        });
 
-        self.direct_cells
-            .borrow_mut()
-            .drain_filter(|el| {
-                if let Some(el) = el.upgrade() {
-                    el.destroy_conditionally(generation)
-                } else {
-                    return true;
-                }
-            })
-            .filter(|_| false)
-            .next();
+        drain_filter_vec(&mut self.direct_cells.borrow_mut(), |el| {
+            if let Some(el) = el.upgrade() {
+                el.destroy_conditionally(generation)
+            } else {
+                return true;
+            }
+        });
     }
 }
 
@@ -129,7 +136,7 @@ impl<T: Mark + 'static> Gc<T> {
             Mutability::Deep => {
                 let weak = Rc::downgrade(&inner);
                 ENGINE.with(|e| {
-                    e.root_counted.borrow_mut().push_back(weak);
+                    e.root_counted.borrow_mut().push(weak);
 
                     let allocations_now =
                         e.bytes_allocated.get() + std::mem::size_of::<GcInner<T>>();
@@ -147,8 +154,8 @@ impl<T: Mark + 'static> Gc<T> {
             Mutability::Shallow => {
                 let weak = Rc::downgrade(&inner);
                 ENGINE.with(|e| {
-                    e.root_counted.borrow_mut().push_back(weak.clone());
-                    e.direct_cells.borrow_mut().push_back(weak);
+                    e.root_counted.borrow_mut().push(weak.clone());
+                    e.direct_cells.borrow_mut().push(weak);
 
                     // TODO yup, duplicated code, I know
                     let allocations_now =

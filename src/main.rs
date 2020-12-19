@@ -1,8 +1,5 @@
-#![feature(drain_filter)]
-
 use crate::gc::{Gc, GcCell, Mark, Mutability};
 use std::borrow::Borrow;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod gc;
