@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+// TODO implement for linkedlist
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::num::*;
@@ -9,20 +10,48 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::*;
 
+const INITIAL_THRESHOLD: usize = 1000;
+const INCREASE_SPACE_BY: f64 = 1.4;
+
 thread_local! {
     static ENGINE: GcEngine = GcEngine::new();
 }
 
 pub struct GcEngine {
     generation: Cell<u64>,
-    direct_cells: RefCell<LinkedList<Weak<dyn ConditionallyDestroyable>>>,
-    root_counted: RefCell<LinkedList<Weak<dyn Markable>>>,
+    /// We only need to attempt collection when a GcCell RefMut was dropped
+    /// while being at least deeply internally mutable.
+    // TODO  it may be feasible for GcCells to have a unique id (counter),
+    // TODO  with root and unroot accepting a source. Then, only if root and unroot - source
+    // TODO  do not match, a loop may have been "leaked", making collection reasonable.
+    collection_reasonable: Cell<bool>,
+    bytes_allocated: Cell<usize>,
+    last_collection: Cell<usize>,
+    direct_cells: RefCell<Vec<Weak<dyn ConditionallyDestroyable>>>,
+    root_counted: RefCell<Vec<Weak<dyn Markable>>>,
+}
+
+fn drain_filter_vec<T, F>(v: &mut Vec<T>, f: F)
+where
+    F: Fn(&mut T) -> bool,
+{
+    let mut cursor = 0;
+    for i in 0..v.len() {
+        if !f(v.get_mut(cursor).unwrap()) {
+            v.swap(i, cursor);
+            cursor += 1;
+        }
+    }
+    v.truncate(cursor);
 }
 
 impl GcEngine {
     fn new() -> GcEngine {
         GcEngine {
             generation: Cell::new(0),
+            collection_reasonable: Cell::new(false),
+            bytes_allocated: Cell::new(0),
+            last_collection: Cell::new(INITIAL_THRESHOLD),
             direct_cells: RefCell::new(Default::default()),
             root_counted: RefCell::new(Default::default()),
         }
@@ -31,31 +60,24 @@ impl GcEngine {
     pub fn collect(&self) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        self.collection_reasonable.set(false);
 
-        self.root_counted
-            .borrow_mut()
-            .drain_filter(|el| {
-                if let Some(el) = el.upgrade() {
-                    el.mark_if_rooted(generation);
-                    return false;
-                } else {
-                    return true;
-                }
-            })
-            .filter(|_| false)
-            .next();
+        drain_filter_vec(&mut self.root_counted.borrow_mut(), |el| {
+            if let Some(el) = el.upgrade() {
+                el.mark_if_rooted(generation);
+                return false;
+            } else {
+                return true;
+            }
+        });
 
-        self.direct_cells
-            .borrow_mut()
-            .drain_filter(|el| {
-                if let Some(el) = el.upgrade() {
-                    el.destroy_conditionally(generation)
-                } else {
-                    return true;
-                }
-            })
-            .filter(|_| false)
-            .next();
+        drain_filter_vec(&mut self.direct_cells.borrow_mut(), |el| {
+            if let Some(el) = el.upgrade() {
+                el.destroy_conditionally(generation)
+            } else {
+                return true;
+            }
+        });
     }
 }
 
@@ -114,14 +136,39 @@ impl<T: Mark + 'static> Gc<T> {
             Mutability::Deep => {
                 let weak = Rc::downgrade(&inner);
                 ENGINE.with(|e| {
-                    e.root_counted.borrow_mut().push_back(weak);
+                    e.root_counted.borrow_mut().push(weak);
+
+                    let allocations_now =
+                        e.bytes_allocated.get() + std::mem::size_of::<GcInner<T>>();
+                    e.bytes_allocated.set(allocations_now);
+                    if e.collection_reasonable.get()
+                        && allocations_now as f64
+                            > e.last_collection.get() as f64 * INCREASE_SPACE_BY
+                    {
+                        e.collect();
+                        e.last_collection
+                            .set(e.bytes_allocated.get().max(INITIAL_THRESHOLD));
+                    }
                 })
             }
             Mutability::Shallow => {
                 let weak = Rc::downgrade(&inner);
                 ENGINE.with(|e| {
-                    e.root_counted.borrow_mut().push_back(weak.clone());
-                    e.direct_cells.borrow_mut().push_back(weak);
+                    e.root_counted.borrow_mut().push(weak.clone());
+                    e.direct_cells.borrow_mut().push(weak);
+
+                    // TODO yup, duplicated code, I know
+                    let allocations_now =
+                        e.bytes_allocated.get() + std::mem::size_of::<GcInner<T>>();
+                    e.bytes_allocated.set(allocations_now);
+                    if e.collection_reasonable.get()
+                        && allocations_now as f64
+                            > e.last_collection.get() as f64 * INCREASE_SPACE_BY
+                    {
+                        e.collect();
+                        e.last_collection
+                            .set(e.bytes_allocated.get().max(INITIAL_THRESHOLD));
+                    }
                 })
             }
         }
@@ -217,7 +264,10 @@ pub struct GcRef<'a, T: Mark> {
 
 impl<'a, T: Mark> Drop for GcRefMut<'a, T> {
     fn drop(&mut self) {
-        self.inner.borrow().unroot();
+        let mutability = self.inner.borrow().unroot();
+        if mutability.is_root_counted() {
+            ENGINE.with(|e| e.collection_reasonable.set(true));
+        }
     }
 }
 
@@ -385,6 +435,15 @@ impl<T: Mark> Mark for &T {
 
     fn destroy(&self) {
         (*self).destroy()
+    }
+}
+
+impl<T: Mark> Drop for GcInner<T> {
+    fn drop(&mut self) {
+        ENGINE.with(|e| {
+            e.bytes_allocated
+                .set(e.bytes_allocated.get() - std::mem::size_of::<GcInner<T>>())
+        })
     }
 }
 
