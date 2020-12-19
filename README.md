@@ -1,7 +1,7 @@
 # Safe Rust Garbage collection
 
 _This crate is currently not test-covered and thus considered in alpha. If you'd like to use it for a project, just create a ticket and I will
-gladly add plenty of tests. It also does not trigger collection by itself yet._
+gladly add plenty of tests._
 
 safe-gc is a crate that provides the garbage collection primitives
 `Gc` (akin to an `Rc`) and `GcCell` (the equivalent of a `RefCell`)
@@ -26,5 +26,6 @@ and a factor of ~1.3 for retained allocation only.
 In a more intricate worst-case stress test, rust-gc is faster by a factor of _todo_. I am working on it though!
 
 Also note that GcRefs are still kept on the stack and that Gc is also
-reference counted.
+reference counted. If a Gc is not internally mutable (Does not contain a GcRef), it will
+not be considered for marking & root checking, saving performance.
 
