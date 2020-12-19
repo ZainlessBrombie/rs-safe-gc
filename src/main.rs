@@ -16,10 +16,15 @@ enum GcTree {
 
 impl Mark for GcTree {
     fn mark_all(&self, generation: u64) {
-        if let GcTree::Knot(a, b, c) = self {
-            a.mark_all(generation);
-            b.mark_all(generation);
-            c.mark_all(generation);
+        match self {
+            GcTree::Leaf(leaf) => {
+                leaf.mark_all(generation);
+            }
+            GcTree::Knot(a, b, c) => {
+                a.mark_all(generation);
+                b.mark_all(generation);
+                c.mark_all(generation);
+            }
         }
     }
 
@@ -31,10 +36,15 @@ impl Mark for GcTree {
     }
 
     fn root(&self) {
-        if let GcTree::Knot(a, b, c) = self {
-            a.root();
-            b.root();
-            c.root();
+        match self {
+            GcTree::Leaf(leaf) => {
+                leaf.root();
+            }
+            GcTree::Knot(a, b, c) => {
+                a.root();
+                b.root();
+                c.root();
+            }
         }
     }
 
