@@ -16,7 +16,7 @@ The two main advantages of this crate are that it 1) does not implement
 (one of the main reasons I wrote this crate) and implement it yourself if needed
 and 2) is written in safe Rust only, which makes it extra safe to use for more critical projects.
 
-###Performance
+### Performance
 
 The obvious comparison would be rust-gc.  
 In their simple performance benchmark, this crate  
