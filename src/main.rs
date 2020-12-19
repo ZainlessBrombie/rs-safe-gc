@@ -31,7 +31,7 @@ impl Mark for GcTree {
     fn unroot(&self) -> Mutability {
         match self {
             GcTree::Leaf(leaf) => leaf.unroot(),
-            GcTree::Knot(a, b, c) => a.unroot().or(&a.unroot().or(&c.unroot())),
+            GcTree::Knot(a, b, c) => a.unroot().or(&b.unroot().or(&c.unroot())),
         }
     }
 
