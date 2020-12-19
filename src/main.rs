@@ -1,63 +1,18 @@
 #![feature(drain_filter)]
 
-use crate::gc::{Gc, GcCell, Mark, Mutability};
+use gc::{Finalize, Gc, GcCell, Trace};
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-mod gc;
+//mod gc;
 
 static A: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Trace)]
 enum GcTree {
     Leaf(GcCell<Option<Gc<GcTree>>>),
     Knot(Gc<GcTree>, Gc<GcTree>, u8),
-}
-
-impl Mark for GcTree {
-    fn mark_all(&self, generation: u64) {
-        match self {
-            GcTree::Leaf(leaf) => {
-                leaf.mark_all(generation);
-            }
-            GcTree::Knot(a, b, c) => {
-                a.mark_all(generation);
-                b.mark_all(generation);
-                c.mark_all(generation);
-            }
-        }
-    }
-
-    fn unroot(&self) -> Mutability {
-        match self {
-            GcTree::Leaf(leaf) => leaf.unroot(),
-            GcTree::Knot(a, b, c) => a.unroot().or(&a.unroot().or(&c.unroot())),
-        }
-    }
-
-    fn root(&self) {
-        match self {
-            GcTree::Leaf(leaf) => {
-                leaf.root();
-            }
-            GcTree::Knot(a, b, c) => {
-                a.root();
-                b.root();
-                c.root();
-            }
-        }
-    }
-
-    fn destroy(&self) {
-        match self {
-            GcTree::Leaf(leaf) => leaf.destroy(),
-            GcTree::Knot(a, b, c) => {
-                a.destroy();
-                b.destroy();
-                c.destroy();
-            }
-        }
-    }
 }
 
 impl GcTree {
@@ -79,14 +34,14 @@ impl GcTree {
                 leaf.borrow_mut().replace(r);
             }
             GcTree::Knot(k, _, _) => {
-                Gc::borrow(k).inject(r);
+                k.inject(r);
             }
         }
     }
 }
 
-impl Drop for GcTree {
-    fn drop(&mut self) {
+impl Finalize for GcTree {
+    fn finalize(&self) {
         A.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -104,7 +59,8 @@ fn main() {
     );
 
     before = std::time::Instant::now();
-    Gc::collect();
+    gc::force_collect();
+
     after = std::time::Instant::now();
 
     println!(
@@ -115,9 +71,10 @@ fn main() {
     println!("Created objects: {}", A.load(Ordering::Relaxed));
     std::mem::drop(tree);
     before = std::time::Instant::now();
-    Gc::collect();
+    gc::force_collect();
     std::mem::drop(tree2);
-    Gc::collect();
+    gc::force_collect();
+
     after = std::time::Instant::now();
 
     println!(
